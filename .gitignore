@@ -1,0 +1,17 @@
+# Compiled binaries
+bin/
+*.exe
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Test files
+*.test
