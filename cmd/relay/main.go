@@ -15,7 +15,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Tunnel represents one connected client
 type Tunnel struct {
 	ID       string
 	Conn     *websocket.Conn
@@ -23,19 +22,16 @@ type Tunnel struct {
 	ReqMu    sync.Mutex
 }
 
-// Message is the envelope for all communication
 type Message struct {
 	Type    string          `json:"type"`
 	Payload json.RawMessage `json:"payload"`
 }
 
-// RegisteredPayload tells the client their public URL
 type RegisteredPayload struct {
 	URL       string `json:"url"`
 	Subdomain string `json:"subdomain"`
 }
 
-// RequestPayload is an HTTP request to forward
 type RequestPayload struct {
 	ID      string            `json:"id"`
 	Method  string            `json:"method"`
@@ -44,7 +40,6 @@ type RequestPayload struct {
 	Body    []byte            `json:"body"`
 }
 
-// ResponsePayload is the HTTP response coming back
 type ResponsePayload struct {
 	ID         string            `json:"id"`
 	StatusCode int               `json:"status_code"`
@@ -52,11 +47,9 @@ type ResponsePayload struct {
 	Body       []byte            `json:"body"`
 }
 
-// Store all active tunnels
 var tunnels = make(map[string]*Tunnel)
 var tunnelsMu sync.RWMutex
 
-// WebSocket upgrader
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		return true
@@ -105,14 +98,11 @@ func handleTunnelConnection(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Printf("  New tunnel: %s\n", subdomain)
 
-	// Build the public URL
 	var url string
 	renderURL := os.Getenv("RENDER_EXTERNAL_URL")
 	if renderURL != "" {
-		// Running on Render
 		url = fmt.Sprintf("%s/%s", renderURL, subdomain)
 	} else {
-		// Running locally
 		url = fmt.Sprintf("http://localhost:8080/%s", subdomain)
 	}
 
@@ -199,4 +189,28 @@ func handlePublicRequest(w http.ResponseWriter, r *http.Request) {
 		Body:    body,
 	})
 
-	err := tunnel.Conn.WriteJSON(Message{Type: "request", Payload
+	err := tunnel.Conn.WriteJSON(Message{Type: "request", Payload: reqPayload})
+	if err != nil {
+		http.Error(w, "Failed to forward request to tunnel", http.StatusBadGateway)
+		return
+	}
+
+	fmt.Printf("  %s %s -> %s\n", r.Method, forwardPath, subdomain)
+
+	resp := <-respChan
+
+	for key, value := range resp.Headers {
+		w.Header().Set(key, value)
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	w.Write(resp.Body)
+
+	fmt.Printf("  %s %s <- %d\n", r.Method, forwardPath, resp.StatusCode)
+}
+
+func generateID() string {
+	bytes := make([]byte, 4)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
