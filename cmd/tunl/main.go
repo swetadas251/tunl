@@ -56,7 +56,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	relayURL := "ws://localhost:8080/tunnel"
+	relayURL := "wss://tunl-npt8.onrender.com/tunnel"
 	if len(os.Args) > 2 {
 		relayURL = os.Args[2]
 	}
