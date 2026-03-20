@@ -1,216 +1,208 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
-	"strings"
+	"os/signal"
+	"strconv"
 	"sync"
+	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/swetadas251/tunl/internal/protocol"
 )
 
-type Tunnel struct {
-	ID       string
-	Conn     *websocket.Conn
-	Requests map[string]chan *ResponsePayload
-	ReqMu    sync.Mutex
-}
-
-type Message struct {
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
-}
-
-type RegisteredPayload struct {
-	URL       string `json:"url"`
-	Subdomain string `json:"subdomain"`
-}
-
-type RequestPayload struct {
-	ID      string            `json:"id"`
-	Method  string            `json:"method"`
-	Path    string            `json:"path"`
-	Headers map[string]string `json:"headers"`
-	Body    []byte            `json:"body"`
-}
-
-type ResponsePayload struct {
-	ID         string            `json:"id"`
-	StatusCode int               `json:"status_code"`
-	Headers    map[string]string `json:"headers"`
-	Body       []byte            `json:"body"`
-}
-
-var tunnels = make(map[string]*Tunnel)
-var tunnelsMu sync.RWMutex
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true
-	},
-}
+// writeMu protects concurrent writes to the WebSocket connection.
+// gorilla/websocket only supports one concurrent writer at a time.
+var writeMu sync.Mutex
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: tunl <port> [relay-url]")
+		fmt.Println("")
+		fmt.Println("Examples:")
+		fmt.Println("  tunl 3000")
+		fmt.Println("  tunl 8080 ws://localhost:8080/tunnel")
+		os.Exit(1)
 	}
 
-	http.HandleFunc("/tunnel", handleTunnelConnection)
-	http.HandleFunc("/", handlePublicRequest)
+	port, err := strconv.Atoi(os.Args[1])
+	if err != nil || port < 1 || port > 65535 {
+		fmt.Printf("Invalid port: %s\n", os.Args[1])
+		os.Exit(1)
+	}
 
+	relayURL := "wss://tunl-npt8.onrender.com/tunnel"
+	if len(os.Args) > 2 {
+		relayURL = os.Args[2]
+	}
+
+	localTarget := fmt.Sprintf("http://localhost:%d", port)
+
+	fmt.Println("")
 	fmt.Println("==================================================")
-	fmt.Println("  tunl relay server")
+	fmt.Println("  tunl client")
 	fmt.Println("==================================================")
-	fmt.Printf("  HTTP Server:  http://localhost:%s\n", port)
-	fmt.Printf("  WebSocket:    ws://localhost:%s/tunnel\n", port)
+	fmt.Printf("  Local server:  %s\n", localTarget)
+	fmt.Printf("  Relay server:  %s\n", relayURL)
 	fmt.Println("==================================================")
-	fmt.Println("  Waiting for tunnel clients to connect...")
 	fmt.Println("")
 
-	log.Fatal(http.ListenAndServe(":"+port, nil))
-}
-
-func handleTunnelConnection(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		log.Printf("WebSocket upgrade failed: %v", err)
-		return
-	}
-
-	subdomain := generateID()
-
-	tunnel := &Tunnel{
-		ID:       subdomain,
-		Conn:     conn,
-		Requests: make(map[string]chan *ResponsePayload),
-	}
-
-	tunnelsMu.Lock()
-	tunnels[subdomain] = tunnel
-	tunnelsMu.Unlock()
-
-	fmt.Printf("  New tunnel: %s\n", subdomain)
-
-	var url string
-	renderURL := os.Getenv("RENDER_EXTERNAL_URL")
-	if renderURL != "" {
-		url = fmt.Sprintf("%s/%s", renderURL, subdomain)
+	fmt.Printf("  Checking if localhost:%d is reachable... ", port)
+	if isLocalServerRunning(port) {
+		fmt.Println("yes")
 	} else {
-		url = fmt.Sprintf("http://localhost:8080/%s", subdomain)
+		fmt.Println("no (warning: start your server before sending requests)")
 	}
 
-	payload, _ := json.Marshal(RegisteredPayload{
-		URL:       url,
-		Subdomain: subdomain,
-	})
-	conn.WriteJSON(Message{Type: "registered", Payload: payload})
+	fmt.Printf("  Connecting to relay (may take ~30s on first connect)... ")
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 60 * time.Second,
+	}
+	conn, _, err := dialer.Dial(relayURL, nil)
+	if err != nil {
+		fmt.Println("failed")
+		fmt.Printf("\n  Error: %v\n", err)
+		fmt.Println("\n  Make sure the relay server is running.")
+		fmt.Println("  For local testing: go run ./cmd/relay")
+		os.Exit(1)
+	}
+	fmt.Println("connected")
+
+	writeMu.Lock()
+	conn.WriteJSON(protocol.Message{Type: "register", Payload: nil})
+	writeMu.Unlock()
+
+	var msg protocol.Message
+	err = conn.ReadJSON(&msg)
+	if err != nil || msg.Type != "registered" {
+		fmt.Println("  Registration failed")
+		os.Exit(1)
+	}
+
+	var registered protocol.RegisteredPayload
+	if err := json.Unmarshal(msg.Payload, &registered); err != nil {
+		fmt.Printf("  Failed to parse registration response: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("")
+	fmt.Println("==================================================")
+	fmt.Println("  TUNNEL IS LIVE!")
+	fmt.Println("==================================================")
+	fmt.Println("")
+	fmt.Printf("  Public URL:  %s\n", registered.URL)
+	fmt.Printf("  Forwards to: %s\n", localTarget)
+	fmt.Println("")
+	fmt.Println("==================================================")
+	fmt.Println("  Press Ctrl+C to stop the tunnel")
+	fmt.Println("==================================================")
+	fmt.Println("")
+	fmt.Println("  Requests:")
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\n\n  Tunnel closed. Goodbye!")
+		conn.Close()
+		os.Exit(0)
+	}()
 
 	for {
-		var msg Message
+		var msg protocol.Message
 		err := conn.ReadJSON(&msg)
 		if err != nil {
-			fmt.Printf("  Tunnel %s disconnected\n", subdomain)
+			fmt.Printf("\n  Connection lost: %v\n", err)
 			break
 		}
 
-		if msg.Type == "response" {
-			var resp ResponsePayload
-			json.Unmarshal(msg.Payload, &resp)
-
-			tunnel.ReqMu.Lock()
-			if ch, ok := tunnel.Requests[resp.ID]; ok {
-				ch <- &resp
-				delete(tunnel.Requests, resp.ID)
+		if msg.Type == "request" {
+			var req protocol.RequestPayload
+			if err := json.Unmarshal(msg.Payload, &req); err != nil {
+				fmt.Printf("  Failed to parse request: %v\n", err)
+				continue
 			}
-			tunnel.ReqMu.Unlock()
+			go handleRequest(conn, localTarget, req)
 		}
 	}
-
-	tunnelsMu.Lock()
-	delete(tunnels, subdomain)
-	tunnelsMu.Unlock()
-	conn.Close()
 }
 
-func handlePublicRequest(w http.ResponseWriter, r *http.Request) {
-	path := strings.TrimPrefix(r.URL.Path, "/")
-	parts := strings.SplitN(path, "/", 2)
+func handleRequest(conn *websocket.Conn, localTarget string, req protocol.RequestPayload) {
+	startTime := time.Now()
+	localURL := localTarget + req.Path
 
-	if len(parts) == 0 || parts[0] == "" {
-		w.Header().Set("Content-Type", "text/plain")
-		fmt.Fprintf(w, "tunl relay server\n\n")
-		fmt.Fprintf(w, "To use a tunnel, visit: /<subdomain>/your/path\n")
+	httpReq, err := http.NewRequest(req.Method, localURL, bytes.NewReader(req.Body))
+	if err != nil {
+		sendErrorResponse(conn, req.ID, 500, "Failed to create request")
+		printRequest(req.Method, req.Path, 500, time.Since(startTime))
 		return
 	}
 
-	subdomain := parts[0]
-	forwardPath := "/"
-	if len(parts) > 1 {
-		forwardPath = "/" + parts[1]
+	for key, value := range req.Headers {
+		httpReq.Header.Set(key, value)
 	}
 
-	tunnelsMu.RLock()
-	tunnel, exists := tunnels[subdomain]
-	tunnelsMu.RUnlock()
-
-	if !exists {
-		http.Error(w, fmt.Sprintf("Tunnel '%s' not found", subdomain), http.StatusNotFound)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		sendErrorResponse(conn, req.ID, 502, "Could not reach local server")
+		printRequest(req.Method, req.Path, 502, time.Since(startTime))
 		return
 	}
+	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(r.Body)
+	body, _ := io.ReadAll(resp.Body)
 
 	headers := make(map[string]string)
-	for key, values := range r.Header {
+	for key, values := range resp.Header {
 		if len(values) > 0 {
 			headers[key] = values[0]
 		}
 	}
 
-	reqID := generateID()
-
-	respChan := make(chan *ResponsePayload, 1)
-	tunnel.ReqMu.Lock()
-	tunnel.Requests[reqID] = respChan
-	tunnel.ReqMu.Unlock()
-
-	reqPayload, _ := json.Marshal(RequestPayload{
-		ID:      reqID,
-		Method:  r.Method,
-		Path:    forwardPath,
-		Headers: headers,
-		Body:    body,
+	payload, _ := json.Marshal(protocol.ResponsePayload{
+		ID:         req.ID,
+		StatusCode: resp.StatusCode,
+		Headers:    headers,
+		Body:       body,
 	})
 
-	err := tunnel.Conn.WriteJSON(Message{Type: "request", Payload: reqPayload})
-	if err != nil {
-		http.Error(w, "Failed to forward request to tunnel", http.StatusBadGateway)
-		return
-	}
+	writeMu.Lock()
+	conn.WriteJSON(protocol.Message{Type: "response", Payload: payload})
+	writeMu.Unlock()
 
-	fmt.Printf("  %s %s -> %s\n", r.Method, forwardPath, subdomain)
-
-	resp := <-respChan
-
-	for key, value := range resp.Headers {
-		w.Header().Set(key, value)
-	}
-
-	w.WriteHeader(resp.StatusCode)
-	w.Write(resp.Body)
-
-	fmt.Printf("  %s %s <- %d\n", r.Method, forwardPath, resp.StatusCode)
+	printRequest(req.Method, req.Path, resp.StatusCode, time.Since(startTime))
 }
 
-func generateID() string {
-	bytes := make([]byte, 4)
-	rand.Read(bytes)
-	return hex.EncodeToString(bytes)
+func sendErrorResponse(conn *websocket.Conn, reqID string, status int, message string) {
+	payload, _ := json.Marshal(protocol.ResponsePayload{
+		ID:         reqID,
+		StatusCode: status,
+		Headers:    map[string]string{"Content-Type": "text/plain"},
+		Body:       []byte(message),
+	})
+
+	writeMu.Lock()
+	conn.WriteJSON(protocol.Message{Type: "response", Payload: payload})
+	writeMu.Unlock()
+}
+
+func printRequest(method, path string, status int, duration time.Duration) {
+	fmt.Printf("  %s %s -> %d (%dms)\n", method, path, status, duration.Milliseconds())
+}
+
+func isLocalServerRunning(port int) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://localhost:%d", port))
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return true
 }
