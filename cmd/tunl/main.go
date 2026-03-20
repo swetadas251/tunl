@@ -9,36 +9,17 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/swetadas251/tunl/internal/protocol"
 )
 
-type Message struct {
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
-}
-
-type RegisteredPayload struct {
-	URL       string `json:"url"`
-	Subdomain string `json:"subdomain"`
-}
-
-type RequestPayload struct {
-	ID      string            `json:"id"`
-	Method  string            `json:"method"`
-	Path    string            `json:"path"`
-	Headers map[string]string `json:"headers"`
-	Body    []byte            `json:"body"`
-}
-
-type ResponsePayload struct {
-	ID         string            `json:"id"`
-	StatusCode int               `json:"status_code"`
-	Headers    map[string]string `json:"headers"`
-	Body       []byte            `json:"body"`
-}
+// writeMu protects concurrent writes to the WebSocket connection.
+// gorilla/websocket only supports one concurrent writer at a time.
+var writeMu sync.Mutex
 
 func main() {
 	if len(os.Args) < 2 {
@@ -76,31 +57,39 @@ func main() {
 	if isLocalServerRunning(port) {
 		fmt.Println("yes")
 	} else {
-		fmt.Println("no (warning)")
+		fmt.Println("no (warning: start your server before sending requests)")
 	}
 
-	fmt.Printf("  Connecting to relay... ")
-	conn, _, err := websocket.DefaultDialer.Dial(relayURL, nil)
+	fmt.Printf("  Connecting to relay (may take ~30s on first connect)... ")
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 60 * time.Second,
+	}
+	conn, _, err := dialer.Dial(relayURL, nil)
 	if err != nil {
 		fmt.Println("failed")
 		fmt.Printf("\n  Error: %v\n", err)
-		fmt.Println("\n  Make sure the relay server is running:")
-		fmt.Println("    ./bin/relay.exe")
+		fmt.Println("\n  Make sure the relay server is running.")
+		fmt.Println("  For local testing: go run ./cmd/relay")
 		os.Exit(1)
 	}
 	fmt.Println("connected")
 
-	conn.WriteJSON(Message{Type: "register", Payload: nil})
+	writeMu.Lock()
+	conn.WriteJSON(protocol.Message{Type: "register", Payload: nil})
+	writeMu.Unlock()
 
-	var msg Message
+	var msg protocol.Message
 	err = conn.ReadJSON(&msg)
 	if err != nil || msg.Type != "registered" {
 		fmt.Println("  Registration failed")
 		os.Exit(1)
 	}
 
-	var registered RegisteredPayload
-	json.Unmarshal(msg.Payload, &registered)
+	var registered protocol.RegisteredPayload
+	if err := json.Unmarshal(msg.Payload, &registered); err != nil {
+		fmt.Printf("  Failed to parse registration response: %v\n", err)
+		os.Exit(1)
+	}
 
 	fmt.Println("")
 	fmt.Println("==================================================")
@@ -126,7 +115,7 @@ func main() {
 	}()
 
 	for {
-		var msg Message
+		var msg protocol.Message
 		err := conn.ReadJSON(&msg)
 		if err != nil {
 			fmt.Printf("\n  Connection lost: %v\n", err)
@@ -134,14 +123,17 @@ func main() {
 		}
 
 		if msg.Type == "request" {
-			var req RequestPayload
-			json.Unmarshal(msg.Payload, &req)
+			var req protocol.RequestPayload
+			if err := json.Unmarshal(msg.Payload, &req); err != nil {
+				fmt.Printf("  Failed to parse request: %v\n", err)
+				continue
+			}
 			go handleRequest(conn, localTarget, req)
 		}
 	}
 }
 
-func handleRequest(conn *websocket.Conn, localTarget string, req RequestPayload) {
+func handleRequest(conn *websocket.Conn, localTarget string, req protocol.RequestPayload) {
 	startTime := time.Now()
 	localURL := localTarget + req.Path
 
@@ -174,25 +166,31 @@ func handleRequest(conn *websocket.Conn, localTarget string, req RequestPayload)
 		}
 	}
 
-	payload, _ := json.Marshal(ResponsePayload{
+	payload, _ := json.Marshal(protocol.ResponsePayload{
 		ID:         req.ID,
 		StatusCode: resp.StatusCode,
 		Headers:    headers,
 		Body:       body,
 	})
-	conn.WriteJSON(Message{Type: "response", Payload: payload})
+
+	writeMu.Lock()
+	conn.WriteJSON(protocol.Message{Type: "response", Payload: payload})
+	writeMu.Unlock()
 
 	printRequest(req.Method, req.Path, resp.StatusCode, time.Since(startTime))
 }
 
 func sendErrorResponse(conn *websocket.Conn, reqID string, status int, message string) {
-	payload, _ := json.Marshal(ResponsePayload{
+	payload, _ := json.Marshal(protocol.ResponsePayload{
 		ID:         reqID,
 		StatusCode: status,
 		Headers:    map[string]string{"Content-Type": "text/plain"},
 		Body:       []byte(message),
 	})
-	conn.WriteJSON(Message{Type: "response", Payload: payload})
+
+	writeMu.Lock()
+	conn.WriteJSON(protocol.Message{Type: "response", Payload: payload})
+	writeMu.Unlock()
 }
 
 func printRequest(method, path string, status int, duration time.Duration) {
